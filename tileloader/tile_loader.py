@@ -6,7 +6,6 @@ import requests
 import math
 from multiprocessing.pool import ThreadPool
 from io import BytesIO
-import tempfile
 
 # Latitude, longitude
 WorldCoord = Tuple[float, float]
@@ -34,18 +33,21 @@ URL = str
 RowColPos = Tuple[int, int]
 # Tile position and URL
 TileRecord = Tuple[RowColPos, URL]
+# Width, height
+WH = Tuple[int, int]
 # Tile row count, tile col count
-MapDimensions = Tuple[int, int]
+MapDimensions = Tuple[RowColPos, WH]
 # Complete tile map info
 MapInfo = Tuple[MapDimensions, List[TileRecord]]
 
 
-def build_rect_url(rect: WorldRect, scale: int):
+def build_rect_url(rect: WorldRect, scale: int) -> str:
     return f"https://render.openstreetmap.org/cgi-bin/export?bbox={rect[0][1]},{rect[0][0]},{rect[1][1]},{rect[1][0]}&scale={scale}&format=png"
 
 
-def download_file(record: TileRecord) -> Tuple[TileRecord, BytesIO]:
-    cookies = {"_osm_totp_token": "216681"}
+def download_file(a: Tuple[TileRecord, str]) -> Tuple[TileRecord, BytesIO]:
+    record, token = a
+    cookies = {"_osm_totp_token": token}
     (_, url) = record
     file = BytesIO()
     with requests.get(url, cookies=cookies) as read:
@@ -73,28 +75,42 @@ def close_temp_files(rects: List[Tuple[TileRecord, tempfile._TemporaryFileWrappe
 '''
 
 
-def download_multiple_tiles(rect_records: List[TileRecord]) -> List[Tuple[TileRecord, BytesIO]]:
+def download_multiple_tiles(rect_records: List[TileRecord], token: str) -> List[Tuple[TileRecord, BytesIO]]:
     # record_file_pairs = open_temp_files(rect_records)
-    results = ThreadPool(len(rect_records)).imap_unordered(download_file, rect_records)
+    records_with_token = map(lambda rec: (rec, token), rect_records)
+    results = ThreadPool(len(rect_records)).imap_unordered(download_file, records_with_token)
     return list(results)
 
 
 def join_images(record_file_pairs: List[Tuple[TileRecord, BytesIO]],
                 dimensions: MapDimensions, result_file_name: str):
-    record_file_pairs = record_file_pairs
     # To figure out tile pixel dimensions
     (_, file) = record_file_pairs[0]
     with Image.open(file) as img:
         width, height = img.size
 
-    with Image.new('RGB', (dimensions[1] * width, dimensions[0] * height)) as new_im:
+    img_w, img_h = dimensions[1]
+    row_cnt, col_cnt = dimensions[0]
+
+    with Image.new('RGB', (img_w, img_h)) as new_im:
         for ((row, col), _), file in record_file_pairs:
             with Image.open(file) as tile_img:
-                new_im.paste(tile_img, (col * width, row * height))
+                # Y needs to be calculated from the bottom instead of from the top
+                y_offset = img_h - (row_cnt - row) * height
+                new_im.paste(tile_img, (col * width, y_offset))
         new_im.save(result_file_name)
 
 
-def generate_tile_records(rect: WorldRect, scale: int) -> MapInfo:
+def flatten_tile_rows(tiles: List[List[URL]]) -> Tuple[int, List[TileRecord]]:
+    result = []
+    row_count = len(tiles)
+    for row_i, row in enumerate(tiles):
+        for col_i, tile_url in enumerate(row):
+            result.append(((row_count - row_i - 1, col_i), tile_url))
+    return row_count, result
+
+
+def generate_tile_records(rect: WorldRect, scale: int, square: bool = False) -> MapInfo:
     px_per_degree = math.ceil(397000000 / scale)
     tile_side_dg = (MAX_WIDTH_PX / px_per_degree) * 0.998
 
@@ -122,22 +138,31 @@ def generate_tile_records(rect: WorldRect, scale: int) -> MapInfo:
         curr_lat_bottom_dg = actual_lat_top
         curr_lon_left_dg = rect[0][1]
 
-    # Flatten it
-    result = []
-    row_count = len(tiles)
-    for row_i, row in enumerate(tiles):
-        for col_i, tile_url in enumerate(row):
-            result.append(((row_count - row_i - 1, col_i), tile_url))
+    # Flattened tiles
+    row_count, result = flatten_tile_rows(tiles)
+    # Resulting image dimensions in px
+    map_width_dg: float = rect[1][1] - rect[0][1]
+    map_width_px: int = math.floor(px_per_degree * map_width_dg)
+    map_height_px = map_width_px
+    # TODO calculate height in px
+    if square:
+        map_width_px = map_height_px = min(map_width_px, map_width_px)
+    result_img_sides_px: WH = (map_width_px, map_height_px)
+    # Tile row count, tile col count
+    tile_counts: RowColPos = (row_count, len(tiles[0]))
+    # Combined map dimensions
+    dimensions: MapDimensions = (tile_counts, result_img_sides_px)
+    # Combined map info
+    map_info: MapInfo = (dimensions, result)
+    return map_info
 
-    return (row_count, len(tiles[0])), result
 
-
-def build_tile_grid(rect: WorldRect, scale: int):
-    dimensions, tile_records = generate_tile_records(rect, scale)
-    record_file_pairs = download_multiple_tiles(tile_records)
+def build_tile_grid(rect: WorldRect, scale: int, token: str, square: bool = False):
+    dimensions, tile_records = generate_tile_records(rect, scale, square)
+    record_file_pairs = download_multiple_tiles(tile_records, token)
     join_images(record_file_pairs, dimensions, "#a.png")
     # close_temp_files(record_file_pairs)
 
 
 if __name__ == "__main__":
-    build_tile_grid(((49.135403, 16.503313), (49.257874, 16.714003)), 7500)
+    build_tile_grid(((49.121482, 16.492585), (49.283178, 16.740465)), 10000, "909798", True)
