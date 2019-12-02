@@ -121,42 +121,65 @@ def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], s
             raise result
 
 
-def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[int, List[TileRecord]]:
+def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[RowColPos, List[TileRecord]]:
     result = []
     row_count = len(tiles)
     for row_i, row in enumerate(tiles):
         for col_i, tile_url in enumerate(row):
             result.append(((row_count - row_i - 1, col_i), tile_url))
-    return row_count, result
+    col_count = len(tiles[0])
+    return (row_count, col_count), result
 
 
-def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
+def calculate_height_to_width_ratio(latitude_dg: float) -> float:
+    return 1 / math.cos(((latitude_dg / 90) / 2) * math.pi)
+
+
+def calculate_width_coefficients_at_scale(scale: int) -> Tuple[float, float]:
+    px_per_degree_width = math.ceil(397000000 / scale)
+    tile_width_dg = (MAX_WIDTH_PX / px_per_degree_width) * 0.998
+    return px_per_degree_width, tile_width_dg
+
+
+def calculate_image_dimensions_px(rect: WorldRect, px_per_degree_width: float) -> ImgDimensions:
+    # Width
+    map_width_dg: float = rect[1][1] - rect[0][1]
+    map_width_px: int = math.floor(px_per_degree_width * map_width_dg)
+    # Height
+    # TODO Calculate height
+    # lat_mid_dg: float = (rect[0][0] + rect[1][0]) / 2
+    # ratio_in_middle: float = calculate_height_to_width_ratio(lat_mid_dg)
+    # map_height_dg: float = rect[1][0] - rect[0][0]
+    # map_height_px = (map_width_px / ratio_in_middle)
+    return map_width_px, map_width_px
+
+
+def cut_up_into_tiles(rect: WorldRect, tile_width_dg: float):
     """
-    Cuts up the bounding box into multiple squares
-    with the OSM image export limit in mind.
+    Cuts up the passed in rect into tiles of width tile_width_dg
+    and height calculated so that the tiles remain squares.
 
-    :returns MapInfo composed of the resulting image tile count (row, col count),
-             dimensions of the image in pixels and a list of the tile bounding boxes.
+    The topmost and rightmost tiles are larger than they need to
+    be and contain some space out of bounds of rect just so they
+    stay squares. This can be (is) cropped when composing
+    the final image at bitmap level.
     """
-    px_per_degree = math.ceil(397000000 / scale)
-    tile_side_dg = (MAX_WIDTH_PX / px_per_degree) * 0.998
-
     tiles = []
     curr_lat_bottom_dg, curr_lon_left_dg = rect[0]
     while curr_lat_bottom_dg < rect[1][0]:
         # Calculate the actual tile bottom for this row
-        pref_lat_top = curr_lat_bottom_dg + tile_side_dg
+        pref_lat_top = curr_lat_bottom_dg + tile_width_dg
         mid_latitude = (curr_lat_bottom_dg + pref_lat_top) / 2
-        height_to_width_ratio = 1 / math.cos(((mid_latitude / 90) / 2) * math.pi)
-        actual_lat_top = curr_lat_bottom_dg + (tile_side_dg / height_to_width_ratio)
+        height_to_width_ratio = calculate_height_to_width_ratio(mid_latitude)
+        actual_lat_top = curr_lat_bottom_dg + (tile_width_dg / height_to_width_ratio)
 
         # Create the tiles of this row
         tile_row = []
         while curr_lon_left_dg < rect[1][1]:
-            new_tile: WorldRect = (
-                (curr_lat_bottom_dg, curr_lon_left_dg), (actual_lat_top, curr_lon_left_dg + tile_side_dg))
-            tile_row.append(new_tile)
-            curr_lon_left_dg += tile_side_dg
+            top_left = (curr_lat_bottom_dg, curr_lon_left_dg)
+            bottom_right = (actual_lat_top, curr_lon_left_dg + tile_width_dg)
+            tile_row.append((top_left, bottom_right))
+            curr_lon_left_dg += tile_width_dg
 
         # Save the finished row
         tiles.append(tile_row)
@@ -164,17 +187,22 @@ def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
         # Set values for the next row
         curr_lat_bottom_dg = actual_lat_top
         curr_lon_left_dg = rect[0][1]
+    return tiles
 
-    # Flattened tiles
-    row_count, result = flatten_tile_rows(tiles)
-    # Resulting image dimensions in px
-    map_width_dg: float = rect[1][1] - rect[0][1]
-    map_width_px: int = math.floor(px_per_degree * map_width_dg)
-    map_height_px = map_width_px
-    # TODO calculate height in px
-    result_img_sides_px: ImgDimensions = (map_width_px, map_height_px)
-    # Tile row count, tile col count
-    tile_counts: RowColPos = (row_count, len(tiles[0]))
+
+def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
+    """
+    Cuts up the bounding box into multiple squares with the OSM image export limit
+    in mind and calculates the resulting map dimensions.
+
+    :returns MapInfo composed of the resulting image tile count (row, col count),
+             dimensions of the image in pixels and a list of the tile bounding boxes.
+    """
+    px_per_degree_width, tile_width_dg = calculate_width_coefficients_at_scale(scale)
+    tiles = cut_up_into_tiles(rect, tile_width_dg)
+    result_img_sides_px = calculate_image_dimensions_px(rect, px_per_degree_width)
+    # Tile (row count, col count), flattened tiles
+    tile_counts, result = flatten_tile_rows(tiles)
     # Combined map dimensions
     dimensions: MapDimensions = (tile_counts, result_img_sides_px)
     # Combined map info
@@ -184,8 +212,7 @@ def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
 
 def join_images(record_file_pairs: Iterator[Tuple[RowColPos, IO]],
                 dimensions: MapDimensions, result_file_name: str):
-    img_w, img_h = dimensions[1]
-    row_cnt, col_cnt = dimensions[0]
+    (row_cnt, col_cnt), (img_w, img_h) = dimensions
 
     with Image.new('RGB', (img_w, img_h)) as new_im:
         for (row, col), io_in in record_file_pairs:
@@ -219,4 +246,4 @@ def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
 
 if __name__ == "__main__":
     bb: WorldRect = ((49.121482, 16.492585), (49.283178, 16.740465))
-    generate_map_in_scale(bb, 4000, "336897", "GetRekt.png")
+    generate_map_in_scale(bb, 8500, "433343", "brno.png")
