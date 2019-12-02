@@ -1,107 +1,127 @@
-from typing import List, Tuple, BinaryIO
-from PIL import Image
-import urllib.request
-import urllib.error
-import requests
 import math
 from multiprocessing.pool import ThreadPool
+from PIL import Image
+import requests
+import tempfile
+from typing import IO, Iterator, List, Tuple, Union
 from io import BytesIO
+
+MAX_SIZE_PX = 4_000_000
+"""Maximum pixel count of a map tile. Hardcoded limit in OSM exporting endpoint."""
+MAX_WIDTH_PX = math.sqrt(MAX_SIZE_PX)
+"""Maximum side of a square tile in pixels"""
 
 # Latitude, longitude
 WorldCoord = Tuple[float, float]
-
-MAX_SIZE_PX = 4_000_000
-MAX_WIDTH_PX = math.sqrt(MAX_SIZE_PX)
+"""A single real-world geographic coordinate"""
 
 
-def validate_coord(coord: WorldCoord) -> bool:
-    # TODO
-    return True
+def check_valid_coord(coord: WorldCoord):
+    """:raises ValueError if latitude or longitude is out of the allowed range"""
+    lat, lon = coord
+    if lat < -90.0 or lat > 90.0:
+        raise ValueError("Latitude must be between -90 and 90")
+    if lon < -180.0 or lon > 180.0:
+        raise ValueError("Longitude must be between -180 and 180")
 
 
 # Top left, bottom right
 WorldRect = Tuple[WorldCoord, WorldCoord]
 
 
-def validate_rect(rect: WorldRect) -> bool:
-    # TODO
-    return True
+def check_and_normalize_rect(rect: WorldRect) -> WorldRect:
+    """
+    Reorders and returns the passed in coordinates
+    in the valid order (top-left, bottom-right).
+
+    :raises ValueError if latitude or longitude is out of the allowed range
+    """
+    c1, c2 = rect
+    check_valid_coord(c1)
+    check_valid_coord(c2)
+    top_left = min(c1[0], c2[0]), min(c1[1], c2[1])
+    bottom_right = max(c1[0], c2[0]), max(c1[1], c2[1])
+    return top_left, bottom_right
 
 
 URL = str
-# Position of a tile in a tile grid
+"""Just a good-ol` URL"""
+
 RowColPos = Tuple[int, int]
-# Tile position and URL
-TileRecord = Tuple[RowColPos, URL]
-# Width, height
-WH = Tuple[int, int]
-# Tile row count, tile col count
-MapDimensions = Tuple[RowColPos, WH]
-# Complete tile map info
+"""The (row, col) position of a single map tile in the final image"""
+
+TileRecord = Tuple[RowColPos, WorldRect]
+"""Position of a tile in the resulting image and its bounding box in degrees"""
+
+ImgDimensions = Tuple[int, int]
+"""Width and height in pixels"""
+
+MapDimensions = Tuple[RowColPos, ImgDimensions]
+"""Count of rows and columns of map tiles in the map, map dimensions in pixels"""
+
 MapInfo = Tuple[MapDimensions, List[TileRecord]]
+"""
+Complete information about the map comprised of its dimensions,
+scale and a list of tiles that the map is composed of.
+
+The tiles are all of the same size and the image must be built from
+top to bottom and from left to right!!!
+"""
 
 
-def build_rect_url(rect: WorldRect, scale: int) -> str:
+def build_osm_rect_url(rect: WorldRect, scale: int) -> URL:
+    """Generates a URL for a single map tile to be downloaded from the OSM export endpoint."""
     return f"https://render.openstreetmap.org/cgi-bin/export?bbox={rect[0][1]},{rect[0][0]},{rect[1][1]},{rect[1][0]}&scale={scale}&format=png"
 
 
-def download_file(a: Tuple[TileRecord, str]) -> Tuple[TileRecord, BytesIO]:
-    record, token = a
+OsmTileDownloadArgs = Tuple[WorldRect, int, str, IO]
+"""
+The info about a tile to be downloaded with the scale, request token
+and an IO object where the PNG data should be written into.
+The token is included with each OSM endpoint request as '_osm_totp_token'.
+"""
+
+
+def download_osm_tile(args: OsmTileDownloadArgs) -> Union[bool, Exception]:
+    """
+    Downloads a single OSM map tile into the provided output stream.
+    :returns True on success, URLError on failure.
+    """
+    box, scale, token, io_out = args
+    # Cookie is required!
     cookies = {"_osm_totp_token": token}
-    (_, url) = record
-    file = BytesIO()
-    with requests.get(url, cookies=cookies) as read:
+    url = build_osm_rect_url(box, scale)
+    with requests.get(url, cookies=cookies) as response:
+        if response.status_code == 400:
+            raise ValueError("The token is invalid!")
+        elif response.status_code == 500:
+            raise ValueError("The scale is out of range!")
+        elif not response:
+            raise Exception(response.content)
         try:
-            for chunk in read.iter_content(chunk_size=512):
+            for chunk in response.iter_content(chunk_size=512):
                 if chunk:
-                    file.write(chunk)
-                    file.flush()
-            return record, file
-        except urllib.error.URLError as e:
-            print(record, "failed!!!", e)
-            file.close()
-            return None
+                    io_out.write(chunk)
+            io_out.flush()
+            return True
+        except Exception as e:
+            return e
 
 
-'''
-def open_temp_files(rect_records: List[TileRecord]) -> List[Tuple[TileRecord, tempfile._TemporaryFileWrapper]]:
-    return [(record, tempfile.TemporaryFile(delete=True)) for record in rect_records]
+def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], scale: int, token: str) -> None:
+    """
+    Downloads all of the tiles described by rect_records into their provided IO streams.
+
+    :raises URLError of first failed request (if any).
+    """
+    mapped_args = list(map(lambda pair: (pair[0], scale, token, pair[1]), rect_records))
+    results = ThreadPool(len(mapped_args)).imap(download_osm_tile, mapped_args)
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
 
 
-
-def close_temp_files(rects: List[Tuple[TileRecord, tempfile._TemporaryFileWrapper]]) -> None:
-    for _, io in rects:
-        io.close()
-'''
-
-
-def download_multiple_tiles(rect_records: List[TileRecord], token: str) -> List[Tuple[TileRecord, BytesIO]]:
-    # record_file_pairs = open_temp_files(rect_records)
-    records_with_token = map(lambda rec: (rec, token), rect_records)
-    results = ThreadPool(len(rect_records)).imap_unordered(download_file, records_with_token)
-    return list(results)
-
-
-def join_images(record_file_pairs: List[Tuple[TileRecord, BytesIO]],
-                dimensions: MapDimensions, result_file_name: str):
-    # To figure out tile pixel dimensions
-    (_, file) = record_file_pairs[0]
-    with Image.open(file) as img:
-        width, height = img.size
-
-    img_w, img_h = dimensions[1]
-    row_cnt, col_cnt = dimensions[0]
-
-    with Image.new('RGB', (img_w, img_h)) as new_im:
-        for ((row, col), _), file in record_file_pairs:
-            with Image.open(file) as tile_img:
-                # Y needs to be calculated from the bottom instead of from the top
-                y_offset = img_h - (row_cnt - row) * height
-                new_im.paste(tile_img, (col * width, y_offset))
-        new_im.save(result_file_name)
-
-
-def flatten_tile_rows(tiles: List[List[URL]]) -> Tuple[int, List[TileRecord]]:
+def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[int, List[TileRecord]]:
     result = []
     row_count = len(tiles)
     for row_i, row in enumerate(tiles):
@@ -110,7 +130,14 @@ def flatten_tile_rows(tiles: List[List[URL]]) -> Tuple[int, List[TileRecord]]:
     return row_count, result
 
 
-def generate_tile_records(rect: WorldRect, scale: int, square: bool = False) -> MapInfo:
+def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
+    """
+    Cuts up the bounding box into multiple squares
+    with the OSM image export limit in mind.
+
+    :returns MapInfo composed of the resulting image tile count (row, col count),
+             dimensions of the image in pixels and a list of the tile bounding boxes.
+    """
     px_per_degree = math.ceil(397000000 / scale)
     tile_side_dg = (MAX_WIDTH_PX / px_per_degree) * 0.998
 
@@ -126,9 +153,9 @@ def generate_tile_records(rect: WorldRect, scale: int, square: bool = False) -> 
         # Create the tiles of this row
         tile_row = []
         while curr_lon_left_dg < rect[1][1]:
-            new_tile = ((curr_lat_bottom_dg, curr_lon_left_dg), (actual_lat_top, curr_lon_left_dg + tile_side_dg))
-            url = build_rect_url(new_tile, scale)
-            tile_row.append(url)
+            new_tile: WorldRect = (
+                (curr_lat_bottom_dg, curr_lon_left_dg), (actual_lat_top, curr_lon_left_dg + tile_side_dg))
+            tile_row.append(new_tile)
             curr_lon_left_dg += tile_side_dg
 
         # Save the finished row
@@ -145,9 +172,7 @@ def generate_tile_records(rect: WorldRect, scale: int, square: bool = False) -> 
     map_width_px: int = math.floor(px_per_degree * map_width_dg)
     map_height_px = map_width_px
     # TODO calculate height in px
-    if square:
-        map_width_px = map_height_px = min(map_width_px, map_width_px)
-    result_img_sides_px: WH = (map_width_px, map_height_px)
+    result_img_sides_px: ImgDimensions = (map_width_px, map_height_px)
     # Tile row count, tile col count
     tile_counts: RowColPos = (row_count, len(tiles[0]))
     # Combined map dimensions
@@ -157,12 +182,41 @@ def generate_tile_records(rect: WorldRect, scale: int, square: bool = False) -> 
     return map_info
 
 
-def build_tile_grid(rect: WorldRect, scale: int, token: str, square: bool = False):
-    dimensions, tile_records = generate_tile_records(rect, scale, square)
-    record_file_pairs = download_multiple_tiles(tile_records, token)
-    join_images(record_file_pairs, dimensions, "#a.png")
-    # close_temp_files(record_file_pairs)
+def join_images(record_file_pairs: Iterator[Tuple[RowColPos, IO]],
+                dimensions: MapDimensions, result_file_name: str):
+    img_w, img_h = dimensions[1]
+    row_cnt, col_cnt = dimensions[0]
+
+    with Image.new('RGB', (img_w, img_h)) as new_im:
+        for (row, col), io_in in record_file_pairs:
+            with Image.open(io_in) as tile_img:
+                width, height = tile_img.size
+                # Y needs to be calculated from the bottom instead of from the top
+                y_offset = img_h - (row_cnt - row) * height
+                new_im.paste(tile_img, (col * width, y_offset))
+        new_im.save(result_file_name)
+
+
+def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
+                          file_name: str, in_memory: bool = False):
+    # Check the params!
+    rect_normalized = check_and_normalize_rect(rect)
+    # Cut the map into squares!
+    dimensions, tile_records = generate_tile_records_in_scale(rect_normalized, scale)
+
+    # Create IO buffer for each tile!
+    ios = list(map(lambda _: BytesIO() if in_memory else tempfile.TemporaryFile(delete=True), tile_records))
+    bounding_boxes = map(lambda tile: tile[1], tile_records)
+    # Download the tiles!
+    download_multiple_osm_tiles(zip(bounding_boxes, ios), scale, token)
+    # Join them!
+    img_positions = map(lambda tile: tile[0], tile_records)
+    join_images(zip(img_positions, ios), dimensions, file_name)
+    # Close the streams!
+    for io in ios:
+        io.close()
 
 
 if __name__ == "__main__":
-    build_tile_grid(((49.121482, 16.492585), (49.283178, 16.740465)), 10000, "909798", True)
+    bb: WorldRect = ((49.121482, 16.492585), (49.283178, 16.740465))
+    generate_map_in_scale(bb, 4000, "336897", "GetRekt.png")
