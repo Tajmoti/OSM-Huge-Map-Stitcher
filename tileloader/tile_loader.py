@@ -1,7 +1,9 @@
+import argparse
 import math
 from multiprocessing.pool import ThreadPool
 from PIL import Image
 import requests
+import sys
 import tempfile
 from typing import IO, Iterator, List, Tuple, Union
 from io import BytesIO
@@ -95,27 +97,36 @@ def download_osm_tile(args: OsmTileDownloadArgs) -> Union[bool, Exception]:
         if response.status_code == 400:
             raise ValueError("The token is invalid!")
         elif response.status_code == 500:
-            raise ValueError("The scale is out of range!")
+            raise ValueError("Internal server error! The scale is probably out of range.")
         elif not response:
             raise Exception(response.content)
-        try:
-            for chunk in response.iter_content(chunk_size=512):
-                if chunk:
-                    io_out.write(chunk)
-            io_out.flush()
-            return True
-        except Exception as e:
-            return e
+
+        for chunk in response.iter_content(chunk_size=512):
+            if chunk:
+                io_out.write(chunk)
+        io_out.flush()
+        return True
 
 
-def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], scale: int, token: str) -> None:
+def get_osm_token() -> str:
+    with requests.get("https://www.openstreetmap.org/") as response:
+        if not response:
+            raise SystemError("Unable to get OSM token!")
+        elif "_osm_totp_token" in response.cookies:
+            return response.cookies["_osm_totp_token"]
+        else:
+            raise SystemError("Token cookie not present in response!")
+
+
+def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], scale: int) -> None:
     """
     Downloads all of the tiles described by rect_records into their provided IO streams.
 
     :raises URLError of first failed request (if any).
     """
+    token = get_osm_token()
     mapped_args = list(map(lambda pair: (pair[0], scale, token, pair[1]), rect_records))
-    results = ThreadPool(len(mapped_args)).imap(download_osm_tile, mapped_args)
+    results = ThreadPool(len(mapped_args)).imap_unordered(download_osm_tile, mapped_args)
     for result in results:
         if isinstance(result, Exception):
             raise result
@@ -224,8 +235,8 @@ def join_images(record_file_pairs: Iterator[Tuple[RowColPos, IO]],
         new_im.save(result_file_name)
 
 
-def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
-                          file_name: str, in_memory: bool = False):
+def generate_map_in_scale(rect: WorldRect, scale: int, file_name: str,
+                          in_memory: bool = False):
     # Check the params!
     rect_normalized = check_and_normalize_rect(rect)
     # Cut the map into squares!
@@ -235,7 +246,7 @@ def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
     ios = list(map(lambda _: BytesIO() if in_memory else tempfile.TemporaryFile(), tile_records))
     bounding_boxes = map(lambda tile: tile[1], tile_records)
     # Download the tiles!
-    download_multiple_osm_tiles(zip(bounding_boxes, ios), scale, token)
+    download_multiple_osm_tiles(zip(bounding_boxes, ios), scale)
     # Join them!
     img_positions = map(lambda tile: tile[0], tile_records)
     join_images(zip(img_positions, ios), dimensions, file_name)
@@ -245,5 +256,16 @@ def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
 
 
 if __name__ == "__main__":
-    bb: WorldRect = ((49.121482, 16.492585), (49.283178, 16.740465))
-    generate_map_in_scale(bb, 8500, "433343", "brno.png")
+    parser = argparse.ArgumentParser("Download and stitch a map from OSM export endpoints.")
+    parser.add_argument("top_lat", type=float)
+    parser.add_argument("top_lon", type=float)
+    parser.add_argument("bottom_lat", type=float)
+    parser.add_argument("bottom_lon", type=float)
+    parser.add_argument("scale", type=int)
+    parser.add_argument("filename", type=str)
+    args = vars(parser.parse_args())
+    bb: WorldRect = ((args["top_lat"], args["top_lon"]), (args["bottom_lat"], args["bottom_lon"]))
+    try:
+        generate_map_in_scale(bb, args["scale"], args["filename"])
+    except Exception as e:
+        sys.exit(e)
