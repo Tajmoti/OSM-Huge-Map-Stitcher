@@ -232,7 +232,7 @@ def generate_map_in_scale(rect: WorldRect, scale: int, token: str,
     dimensions, tile_records = generate_tile_records_in_scale(rect_normalized, scale)
 
     # Create IO buffer for each tile!
-    ios = list(map(lambda _: BytesIO() if in_memory else tempfile.TemporaryFile(delete=True), tile_records))
+    ios = list(map(lambda _: BytesIO() if in_memory else tempfile.TemporaryFile(), tile_records))
     bounding_boxes = map(lambda tile: tile[1], tile_records)
     # Download the tiles!
     download_multiple_osm_tiles(zip(bounding_boxes, ios), scale, token)
