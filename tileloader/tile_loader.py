@@ -129,10 +129,11 @@ def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], s
     """
     token = get_osm_token()
     mapped_args = list(map(lambda pair: (pair[0], scale, token, pair[1]), rect_records))
-    results = ThreadPool(len(mapped_args)).imap_unordered(download_osm_tile, mapped_args)
-    for result in results:
-        if isinstance(result, Exception):
-            raise result
+    with ThreadPool(len(mapped_args)) as pool:
+        results = pool.imap_unordered(download_osm_tile, mapped_args)
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
 
 
 def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[RowColPos, List[TileRecord]]:
@@ -226,7 +227,7 @@ def generate_tile_records_in_scale(rect: WorldRect, scale: int) -> MapInfo:
 
 def join_images(record_file_pairs: Iterator[Tuple[RowColPos, IO]],
                 dimensions: MapDimensions, result_file_name: str):
-    (row_cnt, col_cnt), (img_w, img_h) = dimensions
+    (row_cnt, _), (img_w, img_h) = dimensions
 
     with Image.new('RGB', (img_w, img_h)) as new_im:
         for (row, col), io_in in record_file_pairs:
