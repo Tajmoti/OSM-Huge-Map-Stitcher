@@ -93,19 +93,22 @@ def download_osm_tile(args: OsmTileDownloadArgs) -> Union[bool, Exception]:
     # Cookie is required!
     cookies = {"_osm_totp_token": token}
     url = build_osm_rect_url(box, scale)
-    with requests.get(url, cookies=cookies) as response:
-        if response.status_code == 400:
-            raise ValueError("The token is invalid!")
-        elif response.status_code == 500:
-            raise ValueError("Internal server error! The scale is probably out of range.")
-        elif not response:
-            raise Exception(response.content)
+    try:
+        with requests.get(url, cookies=cookies) as response:
+            if response.status_code == 400:
+                raise ValueError("The token is invalid!")
+            elif response.status_code == 500:
+                raise ValueError("Internal server error! The scale is probably out of range.")
+            elif not response:
+                raise Exception(response.content)
 
         for chunk in response.iter_content(chunk_size=512):
             if chunk:
                 io_out.write(chunk)
         io_out.flush()
         return True
+    except Exception as caught:
+        return caught
 
 
 def get_osm_token() -> str:
