@@ -1,12 +1,13 @@
 import argparse
+import asyncio
 import math
-from multiprocessing.pool import ThreadPool
-from PIL import Image
-import requests
 import sys
-import tempfile
-from typing import IO, Iterator, List, Tuple, Union
 from io import BytesIO
+from typing import IO, Iterator, List, NamedTuple, Tuple, Union
+
+import aiofiles
+import aiohttp
+from PIL import Image
 
 MAX_SIZE_PX = 4_000_000
 """Maximum pixel count of a map tile. Hardcoded limit in OSM exporting endpoint."""
@@ -52,8 +53,14 @@ URL = str
 RowColPos = Tuple[int, int]
 """The (row, col) position of a single map tile in the final image"""
 
-TileRecord = Tuple[RowColPos, WorldRect]
-"""Position of a tile in the resulting image and its bounding box in degrees"""
+
+class TileRecord(NamedTuple):
+    pos: RowColPos
+    rect: WorldRect
+
+
+IOOutType = Union[IO, str]
+"""Either a IO buffer ot a path of file to write to"""
 
 ImgDimensions = Tuple[int, int]
 """Width and height in pixels"""
@@ -76,7 +83,6 @@ def build_osm_rect_url(rect: WorldRect, scale: int) -> URL:
     return f"https://render.openstreetmap.org/cgi-bin/export?bbox={rect[0][1]},{rect[0][0]},{rect[1][1]},{rect[1][0]}&scale={scale}&format=png"
 
 
-OsmTileDownloadArgs = Tuple[WorldRect, int, str, IO]
 """
 The info about a tile to be downloaded with the scale, request token
 and an IO object where the PNG data should be written into.
@@ -84,35 +90,35 @@ The token is included with each OSM endpoint request as '_osm_totp_token'.
 """
 
 
-def download_osm_tile(args: OsmTileDownloadArgs) -> Union[bool, Exception]:
+async def download_osm_tile(session: aiohttp.ClientSession, box: WorldRect, scale: int, io_out: IOOutType) -> None:
     """
     Downloads a single OSM map tile into the provided output stream.
     :returns True on success, URLError on failure.
     """
-    box, scale, token, io_out = args
-    # Cookie is required!
-    cookies = {"_osm_totp_token": token}
     url = build_osm_rect_url(box, scale)
-    try:
-        with requests.get(url, cookies=cookies) as response:
-            if response.status_code == 400:
-                raise ValueError("The token is invalid!")
-            elif response.status_code == 500:
-                raise ValueError("Internal server error! The scale is probably out of range.")
-            elif not response:
-                raise Exception(response.content)
-
-        for chunk in response.iter_content(chunk_size=512):
-            if chunk:
-                io_out.write(chunk)
-        io_out.flush()
-        return True
-    except Exception as caught:
-        return caught
+    async with session.get(url) as response:
+        if response.status == 200:
+            body = await response.read()
+            await write_body(io_out, body)
+        if response.status == 400:
+            raise ValueError("The token is invalid!")
+        elif response.status == 500:
+            raise ValueError("Internal server error! The scale is probably out of range.")
+        elif not response:
+            raise Exception(response.content)
 
 
-def get_osm_token() -> str:
-    with requests.get("https://www.openstreetmap.org/") as response:
+async def write_body(io_out: IOOutType, body: bytes):
+    if io_out is str:
+        async with aiofiles.open(io_out, "wb") as file:
+            await file.write(body)
+    else:
+        io_out.write(body)
+
+
+async def get_osm_token() -> str:
+    async with aiohttp.ClientSession() as session:
+        response = await session.get("https://www.openstreetmap.org/")
         if not response:
             raise SystemError("Unable to get OSM token!")
         elif "_osm_totp_token" in response.cookies:
@@ -121,19 +127,19 @@ def get_osm_token() -> str:
             raise SystemError("Token cookie not present in response!")
 
 
-def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IO]], scale: int) -> None:
+async def download_multiple_osm_tiles(rect_records: Iterator[Tuple[TileRecord, IOOutType]], scale: int) -> None:
     """
     Downloads all of the tiles described by rect_records into their provided IO streams.
 
     :raises URLError of first failed request (if any).
     """
-    token = get_osm_token()
-    mapped_args = list(map(lambda pair: (pair[0], scale, token, pair[1]), rect_records))
-    with ThreadPool(len(mapped_args)) as pool:
-        results = pool.imap_unordered(download_osm_tile, mapped_args)
-        for result in results:
-            if isinstance(result, Exception):
-                raise result
+    token = await get_osm_token()
+    connector = aiohttp.TCPConnector(limit=16)
+    async with aiohttp.ClientSession(cookies={'_osm_totp_token': token}, connector=connector) as session:
+        tasks = []
+        for record in rect_records:
+            tasks.append(download_osm_tile(session, record[0], scale, record[1]))
+        await asyncio.gather(*tasks)
 
 
 def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[RowColPos, List[TileRecord]]:
@@ -141,7 +147,7 @@ def flatten_tile_rows(tiles: List[List[WorldRect]]) -> Tuple[RowColPos, List[Til
     row_count = len(tiles)
     for row_i, row in enumerate(tiles):
         for col_i, tile_url in enumerate(row):
-            result.append(((row_count - row_i - 1, col_i), tile_url))
+            result.append(TileRecord((row_count - row_i - 1, col_i), tile_url))
     col_count = len(tiles[0])
     return (row_count, col_count), result
 
@@ -239,18 +245,18 @@ def join_images(record_file_pairs: Iterator[Tuple[RowColPos, IO]],
         new_im.save(result_file_name)
 
 
-def generate_map_in_scale(rect: WorldRect, scale: int, file_name: str,
-                          in_memory: bool = False):
+async def generate_map_in_scale(rect: WorldRect, scale: int, file_name: str,
+                                in_memory: bool = False):
     # Check the params!
     rect_normalized = check_and_normalize_rect(rect)
     # Cut the map into squares!
     dimensions, tile_records = generate_tile_records_in_scale(rect_normalized, scale)
 
     # Create IO buffer for each tile!
-    ios = list(map(lambda _: BytesIO() if in_memory else tempfile.TemporaryFile(), tile_records))
+    ios = list(map(lambda _: BytesIO(), tile_records))
     bounding_boxes = map(lambda tile: tile[1], tile_records)
     # Download the tiles!
-    download_multiple_osm_tiles(zip(bounding_boxes, ios), scale)
+    await download_multiple_osm_tiles(zip(bounding_boxes, ios), scale)
     # Join them!
     img_positions = map(lambda tile: tile[0], tile_records)
     join_images(zip(img_positions, ios), dimensions, file_name)
@@ -270,6 +276,6 @@ if __name__ == "__main__":
     args = vars(parser.parse_args())
     bb: WorldRect = ((args["top_lat"], args["top_lon"]), (args["bottom_lat"], args["bottom_lon"]))
     try:
-        generate_map_in_scale(bb, args["scale"], args["filename"])
+        asyncio.run(generate_map_in_scale(bb, args["scale"], args["filename"]))
     except Exception as e:
         sys.exit(e)
